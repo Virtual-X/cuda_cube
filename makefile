@@ -1,12 +1,13 @@
 CXXFLAGS += -g -std=c++11 -Wall -Wextra
-CUFLAGS += -g
+CUFLAGS += -g --compiler-options -Wall
 
 ifeq "${config}" "Release"
-	CXXFLAGS += -O3 -mtune=native -march=native -s
+	CXXFLAGS += -O3 #-mtune=native -march=native -s
 	CUFLAGS += -O3 -DNDEBUG
 	OUT = Release
 else
-	CXXFLAGS += -O0 -Wextra
+	CXXFLAGS += -O0 -D_DEBUG=1
+	CUFLAGS += -O0 -D_DEBUG=1
 	OUT = Debug
 endif
 

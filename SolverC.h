@@ -12,7 +12,9 @@
 #include "CandidatesCalculator.h"
 #include "CandidatesT.h"
 
-void CudaSolve(CandidatesOffsets candidatesOffsets, CandidatesMask candidatesMask, std::list<SituationT>& solutions);
+#include <iostream>
+
+int CudaSolve(CandidatesOffsets candidatesOffsets, CandidatesMask candidatesMask, SituationT (&solutions)[MaxSolutions]);
 
 class SolverC {
 public:
@@ -25,9 +27,9 @@ public:
         auto gridSize(board->GetSize());
         Coord pos(Ints(gridSize.size()));
 
-        std::vector<std::vector<FixedPieces>> candidatesPerPiece;
+        std::shared_ptr<CandidatesT::Type> candidatesPerPiece = std::make_shared<CandidatesT::Type>();
         Enumerate(pos, gridSize, [&] {
-        	candidatesPerPiece.push_back((*c)[pos]);
+        	candidatesPerPiece->push_back((*c)[pos]);
             return true;
         });
 
@@ -35,9 +37,10 @@ public:
 	}
 
     void Solve() {
-        std::list<SituationT> solutions;
-        CudaSolve(candidatesT->candidatesOffsets, candidatesT->candidatesMask, solutions);
-        candidatesT->Convert(solutions, this->solutions);
+        SituationT ss[MaxSolutions];
+        const int n = CudaSolve(candidatesT->candidatesOffsets, candidatesT->candidatesMask, ss);
+    	for (int i = 0; i < n; i++)
+    		solutions.push_back(candidatesT->Convert(ss[i]));
     }
 
 private:

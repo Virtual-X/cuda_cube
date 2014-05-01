@@ -4,22 +4,15 @@
 
 #include <thrust/device_vector.h>
 #include <thrust/host_vector.h>
-#include <thrust/iterator/counting_iterator.h>
-#include <thrust/iterator/transform_iterator.h>
-#include <thrust/transform.h>
-
-#include <list>
 
 enum {
-	MaxSolutions = 10000,
 	MaxInput = 64 * 1024,
 	MaxOutput = 2 * 1024 * 1024
 };
 
 template<typename T>
 __host__
-static T* raw(thrust::device_vector<T>& vector)
-{
+static T* raw(thrust::device_vector<T>& vector) {
 	return thrust::raw_pointer_cast(vector.data());
 }
 
@@ -59,6 +52,29 @@ int InitNextValidPosition(int i) {
 	return validPos;
 }
 
+enum ErrorCode {
+	ErrorCodeNone = 0,
+	ErrorCodeInvalidPos = 1,
+	ErrorCodeInvalidCode = 1 << 1,
+	ErrorCodeInvalidIndex = 1 << 2,
+	ErrorCodeInvalidId = 1 << 3,
+	ErrorCodeInvalidId2 = 1 << 4,
+	ErrorCodeInvalidPiece = 1 << 5,
+	ErrorCodeInvalidCandidatesOffsetIndex = 1 << 6,
+	ErrorCodeInvalidLastStepFlag = 1 << 7,
+	ErrorCodeInvalidSolutionsCount = 1 << 8,
+	ErrorCodeInvalidSolversCount = 1 << 9,
+	ErrorCodeInvalidO_LastStep = 1 << 10,
+	ErrorCodeInvalidO_NotLastStep = 1 << 11,
+	ErrorCodeInvalidP_NotLastStep = 1 << 12,
+	ErrorCodeInvalidQ_NotLastStep = 1 << 13,
+	ErrorCodeInvalidX_NotLastStep = 1 << 14,
+	ErrorCodeInvalidActualPiece = 1 << 15,
+	ErrorCodeInvalidLastStepFlagA = 1 << 16,
+	ErrorCodeInvalidLastStepFlagB = 1 << 17,
+	ErrorCodeInvalidLastStepFlagC = 1 << 18
+};
+
 struct Globals {
 	const int2* d_candidatesOffsets; // [PositionsCount][CodesCount][PiecesCount], d_candidatesOffsets[GetCandidatesOffsetIndex(position, code, piece)]
 	CandidatesMask d_candidatesMask;
@@ -68,6 +84,8 @@ struct Globals {
 	int* d_solutionsCount;
 
 	int* d_solversCount; // [PiecesCount]
+
+	int* d_error;
 };
 
 struct Locals {
@@ -77,148 +95,168 @@ struct Locals {
 	int* d_situation;
 };
 
-int GetActualPiece(const thrust::host_vector<int>& solversCountH)
-{
-    for (int i = solversCountH.size(); i > 0; i--) {
-    	if (solversCountH[i - 1] >= MaxInput)
-    		return i - 1;
-    }
-    for (int i = 0; i < PositionsCount; i++) {
-    	if (solversCountH[i] > 0)
-    		return i;
-    }
-    return -1;
+int GetActualPiece(const thrust::host_vector<int>& solversCountH) {
+	for (int i = solversCountH.size(); i > 0; i--) {
+		if (solversCountH[i - 1] >= MaxInput)
+			return i - 1;
+	}
+	for (int i = 0; i < (int)solversCountH.size(); i++) {
+		if (solversCountH[i] > 0)
+			return i;
+	}
+	return -1;
 }
 
-__global__
-void CudaInit(Globals globals, Locals locals)
-{
-	__shared__ int solversCount;
-
-	const int ind = (blockIdx.x * blockDim.x) + threadIdx.x;
-
-	if (ind >= PiecesCount)
-		return;
-
-	if (ind == 0)
-		solversCount = 0;
-
-	__syncthreads();
-
-	int2 beginEnd = globals.d_candidatesOffsets[ind];
-    for (int index = beginEnd.x; index < beginEnd.y; index++) {
-    	uint64_t mask = globals.d_candidatesMask[index]; // to be coalesced
-		const int o = atomicAdd(&solversCount, 1);
-		locals.d_position[o] = 1;
-		locals.d_grid[o] = mask;
-
-		int* current = locals.d_situation + ind;
-    	current[0] = index;
-        for (int k = 1; k < PiecesCount; k++) {
-        	current[k * MaxOutput] = k;
-		}
-        if (ind > 0) {
-        	current[ind * MaxOutput] = 0;
-        }
-    }
-
-	__syncthreads();
-
-	if (ind == 0)
-		globals.d_solversCount[0] = solversCount;
+__device__
+bool CheckIndex(const int index, const int count, const Globals& globals, ErrorCode error) {
+	if (index >= count) {
+		globals.d_error[0] = error;
+		globals.d_error[1] = index;
+	}
+	return index >= count;
 }
 
-
-template<bool IsLastStep>
+template<bool IsLastStep, bool Debug>
 __global__
-void CudaStep(const Globals globals, const Locals locals, const int actualPiece, const int off, const int count)
-{
+void CudaStep(const Globals globals, const Locals locals, const int actualPiece, const int off, const int count) {
 	const int ind = (blockIdx.x * blockDim.x) + threadIdx.x;
 	if (ind >= count)
-	  return;
+		return;
 
 	const int id = actualPiece * MaxOutput + off + ind;
+	if (Debug && CheckIndex(id, PiecesCount * MaxOutput, globals, ErrorCodeInvalidId))
+		return;
+
+	const int id2 = actualPiece * PiecesCount * MaxOutput + off + ind;
+	if (Debug && CheckIndex(id2 + (PiecesCount - 1) * MaxOutput, PiecesCount * PiecesCount * MaxOutput,
+			globals, ErrorCodeInvalidId2))
+		return;
+
 	const uint64_t grid = locals.d_grid[id];
 	const int position = locals.d_position[id];
 
 	const int pos = GetNextPos(grid, position, globals.d_nextValidPosition);
-    const int code = GetCode(grid, pos);
+	if (Debug && CheckIndex(pos, 64, globals, ErrorCodeInvalidPos))
+		return;
 
-    const int2* d_candidatesOffsets_ = globals.d_candidatesOffsets + GetCandidatesOffsetIndex(pos, code, 0);
+	const int code = GetCode(grid, pos);
+	if (Debug && CheckIndex(code, 256, globals, ErrorCodeInvalidCode))
+		return;
+
+	const int candidatesOffsetIndex = GetCandidatesOffsetIndex(pos, code, 0);
+	if (Debug && CheckIndex(candidatesOffsetIndex + PiecesCount - 1, PositionsCount * CodesCount * PiecesCount,
+			globals, ErrorCodeInvalidCandidatesOffsetIndex))
+		return;
+
+	const int2* d_candidatesOffsets_ = globals.d_candidatesOffsets + candidatesOffsetIndex;
 	for (int i = actualPiece; i < PiecesCount; i++) {
-		const int id2 = (actualPiece * PiecesCount + i) * MaxOutput + off + ind;
-		const int piece = locals.d_situation[id2];
+		const int piece = locals.d_situation[id2 + i * MaxOutput];
+		if (Debug && CheckIndex(piece, PiecesCount, globals, ErrorCodeInvalidPiece))
+			return;
+
 		int2 beginEnd = d_candidatesOffsets_[piece];
-        for (int index = beginEnd.x; index < beginEnd.y; index++) {
-        	uint64_t mask = globals.d_candidatesMask[index]; // to be coalesced
-            if (!(mask & grid)) {
-            	if (IsLastStep) {
-            		const int n = atomicAdd(globals.d_solutionsCount, 1);
-            		const int* current = locals.d_situation + (actualPiece * PiecesCount * MaxOutput + off + ind);
-            		int* solution = globals.d_solutions[n].pieces;
-                    for (int k = 0; k < actualPiece; k++) {
-            			solution[k] = current[k * MaxOutput];
-            		}
-                    solution[actualPiece] = i;
-            	}
-            	else {
-            		const int n = atomicAdd(globals.d_solversCount + (actualPiece + 1), 1);
-            		if (n >= MaxOutput)
-            			return;
+		for (int index = beginEnd.x; index < beginEnd.y; index++) {
+			uint64_t mask = globals.d_candidatesMask[index]; // to be coalesced
+			if (!(mask & grid)) {
+				const int* current = locals.d_situation + id2;
+				if (IsLastStep) {
+					if (Debug && CheckIndex(actualPiece, PiecesCount, globals, ErrorCodeInvalidLastStepFlagA))
+						return;
+					if (Debug && CheckIndex(PiecesCount, actualPiece + 2, globals, ErrorCodeInvalidLastStepFlagB))
+						return;
 
-            		int o = (actualPiece + 1) * MaxOutput + n;
-            		locals.d_position[o] = pos + 1;
-            		locals.d_grid[o] = mask | grid;
+					const int n = atomicAdd(globals.d_solutionsCount, 1);
+					if (Debug && CheckIndex(n, MaxSolutions, globals, ErrorCodeInvalidSolutionsCount))
+						return;
 
-            		const int* current = locals.d_situation + (actualPiece * PiecesCount * MaxOutput + off + ind);
-            		int* other = locals.d_situation + ((actualPiece + 1) * PiecesCount * MaxOutput + n);
-                    for (int k = 0; k < actualPiece; k++) {
-                    	other[k * MaxOutput] = current[k * MaxOutput];
-            		}
-                    other[actualPiece * MaxOutput] = index; // last element of situation
-                    for (int k = actualPiece + 1; k < i; k++) {
-                    	other[k * MaxOutput] = current[k * MaxOutput];
-            		}
-                    if (i > actualPiece) {
-                    	other[i * MaxOutput] = current[actualPiece * MaxOutput]; // permutation order
-                    }
-                    for (int k = i + 1; k < PiecesCount; k++) {
-                    	other[k * MaxOutput] = current[k * MaxOutput];
-            		}
-            	}
-            }
-        }
+					int* solution = globals.d_solutions[n].pieces;
+					for (int k = 0; k < actualPiece; k++) {
+						solution[k] = current[k * MaxOutput];
+					}
+					solution[actualPiece] = index; // last element of situation
+				} else {
+					if (Debug && CheckIndex(actualPiece, PiecesCount - 1, globals, ErrorCodeInvalidLastStepFlagC))
+						return;
+
+					const int n = atomicAdd(globals.d_solversCount + (actualPiece + 1), 1);
+					if (Debug && CheckIndex(n, MaxOutput, globals, ErrorCodeInvalidSolversCount))
+						return;
+
+					const int o = (actualPiece + 1) * MaxOutput + n;
+					if (Debug && CheckIndex(o, PiecesCount * MaxOutput,
+							globals, ErrorCodeInvalidO_NotLastStep))
+						return;
+
+					locals.d_position[o] = pos + 1;
+					locals.d_grid[o] = mask | grid;
+
+					if (Debug && CheckIndex(actualPiece + 1, PiecesCount,
+							globals, ErrorCodeInvalidActualPiece))
+						return;
+
+					const int q = (actualPiece + 1) * PiecesCount * MaxOutput + n;
+					if (Debug && CheckIndex(q + (PiecesCount - 1) * MaxOutput, PiecesCount * PiecesCount * MaxOutput,
+							globals, ErrorCodeInvalidQ_NotLastStep))
+						return;
+
+					int* other = locals.d_situation + q;
+					for (int k = 0; k < PiecesCount; k++) {
+						other[k * MaxOutput] = current[k * MaxOutput];
+					}
+					other[i * MaxOutput] = current[actualPiece * MaxOutput]; // permutation order
+					other[actualPiece * MaxOutput] = index; // last element of situation
+
+					if (Debug) {
+						for (int k = actualPiece + 1; k < PiecesCount; k++) {
+							if (CheckIndex(other[k * MaxOutput], PiecesCount, globals, ErrorCodeInvalidX_NotLastStep))
+								return;
+						}
+					}
+				}
+			}
+		}
 	}
 
 	if (ind == 0)
 		atomicSub(globals.d_solversCount + actualPiece, count);
+
+	// loop again for a while!
 }
 
-void CudaSolve(CandidatesOffsets candidatesOffsets, CandidatesMask candidatesMask, std::list<SituationT>& solutions)
-{
+int CudaSolve(CandidatesOffsets candidatesOffsets,	CandidatesMask candidatesMask, SituationT (&solutions)[MaxSolutions]) {
 	TimerC timerInit;
 
 	Globals globals;
 
 	thrust::host_vector<int2> candidatesOffsetsH(PositionsCount * CodesCount * PiecesCount);
-    for (int i = 0; i < PositionsCount; i++) {
-        for (int j = 0; j < CodesCount; j++) {
-            for (int k = 0; k < PiecesCount; k++) {
-            	const int (&co)[PiecesCount + 1] = candidatesOffsets[i][j];
-            	candidatesOffsetsH[GetCandidatesOffsetIndex(i, j, k)] = make_int2(co[k], co[k + 1]);
-            }
-        }
-    }
+	for (int i = 0; i < PositionsCount; i++) {
+		for (int j = 0; j < CodesCount; j++) {
+			for (int k = 0; k < PiecesCount; k++) {
+				const int (&co)[PiecesCount + 1] = candidatesOffsets[i][j];
+				candidatesOffsetsH[GetCandidatesOffsetIndex(i, j, k)] = make_int2(co[k], co[k + 1]);
+			}
+		}
+	}
+
+	const int masksCount = candidatesOffsets[PositionsCount - 1][CodesCount - 1][PiecesCount];
+	assert(candidatesOffsetsH[0].x == 0);
+	assert(candidatesOffsetsH[0].y > 0);
+	for (int i = 1; i < PositionsCount; i++) {
+		assert(candidatesOffsetsH[i].x >= candidatesOffsetsH[i - 1].y);
+		assert(candidatesOffsetsH[i].y >= candidatesOffsetsH[i].x);
+		assert(candidatesOffsetsH[i].y < masksCount);
+	}
+
 	thrust::device_vector<int2> candidatesOffsetsV(candidatesOffsetsH);
 	globals.d_candidatesOffsets = raw(candidatesOffsetsV);
 
-	thrust::device_vector<uint64_t> candidatesMaskV(candidatesMask, candidatesMask + candidatesOffsets[PositionsCount - 1][CodesCount - 1][PiecesCount]);
+	thrust::device_vector<uint64_t> candidatesMaskV(candidatesMask,	candidatesMask + masksCount);
 	globals.d_candidatesMask = raw(candidatesMaskV);
 
 	thrust::device_vector<int> nextValidPositionV(256);
-    for (int i = 0; i < 256; i++) {
-    	nextValidPositionV[i] = InitNextValidPosition(i);
-    }
+	for (int i = 0; i < 256; i++) {
+		nextValidPositionV[i] = InitNextValidPosition(i);
+	}
 	globals.d_nextValidPosition = raw(nextValidPositionV);
 
 	thrust::device_vector<int> solutionsCountV(1);
@@ -229,6 +267,9 @@ void CudaSolve(CandidatesOffsets candidatesOffsets, CandidatesMask candidatesMas
 
 	thrust::device_vector<int> solversCountV(PiecesCount);
 	globals.d_solversCount = raw(solversCountV);
+
+	thrust::device_vector<int> errorV(2);
+	globals.d_error = raw(errorV);
 
 	Locals locals;
 
@@ -243,48 +284,77 @@ void CudaSolve(CandidatesOffsets candidatesOffsets, CandidatesMask candidatesMas
 	locals.d_situation = raw(situationV);
 
 	int actualPiece = 0;
-
-	CudaInit<<< 1, 256 >>>(globals, locals);
+	solversCountV[0] = 1;
+	for (int i = 1; i < PositionsCount; i++) {
+		situationV[i * MaxOutput] = i;
+	}
 
 	thrust::host_vector<int> solversCountH(solversCountV);
 
 	timerInit.Record("Init");
+	TimerC timerLoop;
+
+#if defined _DEBUG
+	const bool DoDebug = true;
+#else
+	const bool DoDebug = false;
+#endif
+
 	int n = 0;
 	do {
-		TimerC timerLoop;
-
 		int count = solversCountV[actualPiece];
 
-		std::cout << n++ << ": s[" << actualPiece << "] = " << count;
+		int sc = solutionsCountV[0];
+		if (sc > 10000)
+			break;
+
+		bool disp = (n % 500) == 0;
+
+		if (disp) {
+//			std::cout << n << ": s[" << actualPiece << "] = " << count;
+			std::cout << n << " [" << (DoDebug ? "D" : "R") << "]: solutions = " << sc;
+		}
 
 		const int off = count > MaxInput ? count - MaxInput : 0;
 		count = min(count, MaxInput);
-	    const int blockSize = 512;
-	    const int gridSize = (count + blockSize - 1) / blockSize;
-	    if (actualPiece == PiecesCount - 1) {
-	    	CudaStep<true>
-	    	<<< gridSize, blockSize >>>
-	    	(globals, locals, actualPiece, off, count);
-	    }
-	    else {
-	    	CudaStep<false>
-	    	<<< gridSize, blockSize >>>
-	    	(globals, locals, actualPiece, off, count);
-	    }
-	    cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
+		const int blockSize = 512;
+		const int gridSize = (count + blockSize - 1) / blockSize;
+		if (actualPiece == PiecesCount - 1) {
+			CudaStep<true, DoDebug> <<<gridSize, blockSize>>>(globals, locals, actualPiece, off, count);
+		} else {
+			CudaStep<false, DoDebug> <<<gridSize, blockSize>>>(globals, locals, actualPiece, off, count);
+		}
+		cudaDeviceSynchronize();
+		checkCudaErrors(cudaGetLastError());
 
+		int error = errorV[0];
+		if (error) {
+			int errorNum = 0;
+			while (error > 1) {
+				error /= 2;
+				errorNum++;
+			}
+			std::cout << "\n\nERROR! " << errorNum << " (" << errorV[1] << ")\n" << std::endl;
+			break;
+		}
 
 		solversCountH[actualPiece] = solversCountV[actualPiece];
-		solversCountH[actualPiece + 1] = solversCountV[actualPiece + 1];
+		if (actualPiece < PiecesCount - 1) {
+			solversCountH[actualPiece + 1] = solversCountV[actualPiece + 1];
+		}
+
 		actualPiece = GetActualPiece(solversCountH);
 
-		timerLoop.Record("");
-		if (solutionsCountV[0] > 0)
-			break;
+		if (disp)
+			timerLoop.Record("");
+
+		++n;
 	} while (actualPiece >= 0);
 
-	solutions.insert(solutions.end(), solutionsV.begin(), solutionsV.begin() + solutionsCountV[0]);
+	const int solutionsCount = solutionsCountV[0];
+	thrust::copy(solutionsV.begin(), solutionsV.begin() + solutionsCount, solutions);
 
-	timerInit.Record("Total");
+	timerInit.Record("\nTotal");
 	std::cout << "Solutions found: " << solutionsCountV[0] << std::endl;
+	return solutionsCount;
 }
