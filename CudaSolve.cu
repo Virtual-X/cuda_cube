@@ -80,12 +80,12 @@ struct Globals {
 	CandidatesMask d_candidatesMask;
 	const int* d_nextValidPosition; // [256];
 
-	SituationT* d_solutions;
+     SituationT* d_solutions; // should be int[PiecesCount][MaxSolutions] to allow coalesced writing, although very very seldom
 	int* d_solutionsCount;
 
 	int* d_solversCount; // [PiecesCount]
 
-	int* d_error;
+     int* d_error; // [2]
 };
 
 struct Locals {
@@ -116,111 +116,195 @@ bool CheckIndex(const int index, const int count, const Globals& globals, ErrorC
 	return index >= count;
 }
 
+enum {
+  BlockSize = 512
+};
+
+int shared_psum(int (&_n)[BlockSize]) {
+  __syncthreads();
+
+  // do
+
+  __syncthreads();
+
+  return last + n[las];
+}
+
+template<bool IsLastStep, bool Debug>
+__device__
+void InitStep(const Globals globals, const Locals locals, const int actualPiece, const int ind,
+  int (&_id2)[BlockSize], int (&_pos)[BlockSize], int (&_grid)[BlockSize],
+  const int* (&situation), const int2* (&candidatesOffsets)) {
+{
+  const int id = actualPiece * MaxOutput + ind;
+  if (Debug && CheckIndex(id, PiecesCount * MaxOutput, globals, ErrorCodeInvalidId))
+    return;
+
+  const int id2 = actualPiece * PiecesCount * MaxOutput + ind;
+  if (Debug && CheckIndex(id2 + (PiecesCount - 1) * MaxOutput, PiecesCount * PiecesCount * MaxOutput,
+    globals, ErrorCodeInvalidId2))
+    return;
+
+  const uint64_t grid = locals.d_grid[id];
+  const int position = locals.d_position[id];
+
+  const int pos = GetNextPos(grid, position, globals.d_nextValidPosition);
+  if (Debug && CheckIndex(pos, 64, globals, ErrorCodeInvalidPos))
+    return;
+
+  const int code = GetCode(grid, pos);
+  if (Debug && CheckIndex(code, 256, globals, ErrorCodeInvalidCode))
+    return;
+
+  const int candidatesOffsetIndex = GetCandidatesOffsetIndex(pos, code, 0);
+  if (Debug && CheckIndex(candidatesOffsetIndex + PiecesCount - 1, PositionsCount * CodesCount * PiecesCount,
+    globals, ErrorCodeInvalidCandidatesOffsetIndex))
+    return;
+
+  const int idx = threadIdx.x;
+  _id2[idx] = id2;
+  _pos[idx] = pos + 1;
+  _grid[idx] = grid;
+
+  situation += id2;
+  candidatesOffsets += candidatesOffsetIndex;
+}
+
+template<bool IsLastStep, bool Debug>
+__device__
+void GetBeginAndCount(const Globals globals, const int* situation, const int i,
+  int (&_begin)[BlockSize], int (&_count)[BlockSize]) {
+{
+  const int piece = situation[i * MaxOutput];
+  if (Debug && CheckIndex(piece, PiecesCount, globals, ErrorCodeInvalidPiece))
+    return;
+
+  int2 beginEnd = candidatesOffsets[piece];
+
+  const int idx = threadIdx.x;
+  _begin[idx] = beginEnd.x;
+  _count[idx] = beginEnd.y - beginEnd.x;
+}
+
 template<bool IsLastStep, bool Debug>
 __global__
 void CudaStep(const Globals globals, const Locals locals, const int actualPiece, const int off, const int count) {
-	const int ind = (blockIdx.x * blockDim.x) + threadIdx.x;
-	if (ind >= count)
-		return;
+  __shared__ int _id2[BlockSize];
+  __shared__ int _pos[BlockSize];
+  __shared__ uint64_t _grid[BlockSize];
 
-	const int id = actualPiece * MaxOutput + off + ind;
-	if (Debug && CheckIndex(id, PiecesCount * MaxOutput, globals, ErrorCodeInvalidId))
-		return;
+  __shared__ int _begin[BlockSize];
+  __shared__ int _count[BlockSize];
+  __shared__ int _temp[BlockSize + 1];
 
-	const int id2 = actualPiece * PiecesCount * MaxOutput + off + ind;
-	if (Debug && CheckIndex(id2 + (PiecesCount - 1) * MaxOutput, PiecesCount * PiecesCount * MaxOutput,
-			globals, ErrorCodeInvalidId2))
-		return;
+  __shared__ int __id2[BlockSize];
+  __shared__ int __pos[BlockSize];
+  __shared__ uint64_t __grid[BlockSize];
 
-	const uint64_t grid = locals.d_grid[id];
-	const int position = locals.d_position[id];
+  const int idx = threadIdx.x;
+  const int ind = (blockIdx.x * blockDim.x) + idx;
 
-	const int pos = GetNextPos(grid, position, globals.d_nextValidPosition);
-	if (Debug && CheckIndex(pos, 64, globals, ErrorCodeInvalidPos))
-		return;
+  const int* situation = locals.d_situation;
+  const int2* candidatesOffsets = globals.d_candidatesOffsets;
+  if (ind < count)
+    InitStep<Debug>(globals, locals, actualPiece, off + ind, _id2, _pos, _grid, situation, candidatesOffsets);
+  
+  for (int i = actualPiece; i < PiecesCount; i++) {
+    if (ind < count)
+      GetBeginAndCount(globals, situation, i, _begin, _count);
 
-	const int code = GetCode(grid, pos);
-	if (Debug && CheckIndex(code, 256, globals, ErrorCodeInvalidCode))
-		return;
+    const int totCount = shared_psum(_count, count);
 
-	const int candidatesOffsetIndex = GetCandidatesOffsetIndex(pos, code, 0);
-	if (Debug && CheckIndex(candidatesOffsetIndex + PiecesCount - 1, PositionsCount * CodesCount * PiecesCount,
-			globals, ErrorCodeInvalidCandidatesOffsetIndex))
-		return;
+    // here we are changing the use of idx, work for others
+    for (int j = 0; j < totCount; j += BlockSize) {
+      const int k = j + idx;
+      if (k >= totCount)
+        break; // nothing better to do?
 
-	const int2* d_candidatesOffsets_ = globals.d_candidatesOffsets + candidatesOffsetIndex;
-	for (int i = actualPiece; i < PiecesCount; i++) {
-		const int piece = locals.d_situation[id2 + i * MaxOutput];
-		if (Debug && CheckIndex(piece, PiecesCount, globals, ErrorCodeInvalidPiece))
-			return;
+      const int px = get_index(k, _count); // the same for many
+      const int index = _begin[px] + (k - _count[px]); // somewhat increasing
+      uint64_t mask = globals.d_candidatesMask[index]; // somewhat coalesced
+      const int grid = _grid[px];
 
-		int2 beginEnd = d_candidatesOffsets_[piece];
-		for (int index = beginEnd.x; index < beginEnd.y; index++) {
-			uint64_t mask = globals.d_candidatesMask[index]; // to be coalesced
-			if (!(mask & grid)) {
-				const int* current = locals.d_situation + id2;
-				if (IsLastStep) {
-					if (Debug && CheckIndex(actualPiece, PiecesCount, globals, ErrorCodeInvalidLastStepFlagA))
-						return;
-					if (Debug && CheckIndex(PiecesCount, actualPiece + 2, globals, ErrorCodeInvalidLastStepFlagB))
-						return;
+      const bool valid = (mask & grid) == 0;
+      _temp[idx] = valid ? 1 : 0;
+      const int nvalid = shared_psum(_temp, min(totCount - j, BlockSize));
 
-					const int n = atomicAdd(globals.d_solutionsCount, 1);
-					if (Debug && CheckIndex(n, MaxSolutions, globals, ErrorCodeInvalidSolutionsCount))
-						return;
+      if (idx == 0) {
+        int* targetCount = IsLastStep ? globals.d_solutionsCount : globals.d_solversCount + (actualPiece + 1);
+        _temp[BlockSize] = atomicAdd(targetCount, nvalid);
+      }
 
-					int* solution = globals.d_solutions[n].pieces;
-					for (int k = 0; k < actualPiece; k++) {
-						solution[k] = current[k * MaxOutput];
-					}
-					solution[actualPiece] = index; // last element of situation
-				} else {
-					if (Debug && CheckIndex(actualPiece, PiecesCount - 1, globals, ErrorCodeInvalidLastStepFlagC))
-						return;
+      if (valid) {
+        const int dest = _temp[idx];
+        if (!IsLastStep) {
+          __grid[dest] = mask | grid;
+          __pos[dest] = _pos[px];
+        }
+        __id2[dest] = _id2[px];
+      }
 
-					const int n = atomicAdd(globals.d_solversCount + (actualPiece + 1), 1);
-					if (Debug && CheckIndex(n, MaxOutput, globals, ErrorCodeInvalidSolversCount))
-						return;
+      if (idx >= nvalid)
+        continue;
 
-					const int o = (actualPiece + 1) * MaxOutput + n;
-					if (Debug && CheckIndex(o, PiecesCount * MaxOutput,
-							globals, ErrorCodeInvalidO_NotLastStep))
-						return;
+      __syncthreads(); // needs _temp[BlockSize], do it only if not continue
 
-					locals.d_position[o] = pos + 1;
-					locals.d_grid[o] = mask | grid;
+      const int* current = locals.d_situation + __id2[idx]; // somewhat increasing
+      const int n = _temp[BlockSize] + idx; // coalesced!
+                 
+      if (IsLastStep) {
+		    if (Debug && CheckIndex(actualPiece, PiecesCount, globals, ErrorCodeInvalidLastStepFlagA))
+			   return;
+		    if (Debug && CheckIndex(PiecesCount, actualPiece + 2, globals, ErrorCodeInvalidLastStepFlagB))
+			   return;
 
-					if (Debug && CheckIndex(actualPiece + 1, PiecesCount,
-							globals, ErrorCodeInvalidActualPiece))
-						return;
+		    if (Debug && CheckIndex(n, MaxSolutions, globals, ErrorCodeInvalidSolutionsCount))
+			   return;
 
-					const int q = (actualPiece + 1) * PiecesCount * MaxOutput + n;
-					if (Debug && CheckIndex(q + (PiecesCount - 1) * MaxOutput, PiecesCount * PiecesCount * MaxOutput,
-							globals, ErrorCodeInvalidQ_NotLastStep))
-						return;
+		    int* solution = globals.d_solutions[n].pieces;
+		    for (int k = 0; k < actualPiece; k++) {
+			   solution[k] = current[k * MaxOutput];
+		    }
+		    solution[actualPiece] = index; // last element of situation
+	   } else {
+		    if (Debug && CheckIndex(actualPiece, PiecesCount - 1, globals, ErrorCodeInvalidLastStepFlagC))
+			   return;
 
-					int* other = locals.d_situation + q;
-					for (int k = 0; k < PiecesCount; k++) {
-						other[k * MaxOutput] = current[k * MaxOutput];
-					}
-					other[i * MaxOutput] = current[actualPiece * MaxOutput]; // permutation order
-					other[actualPiece * MaxOutput] = index; // last element of situation
+		    if (Debug && CheckIndex(n, MaxOutput, globals, ErrorCodeInvalidSolversCount))
+			   return;
 
-					if (Debug) {
-						for (int k = actualPiece + 1; k < PiecesCount; k++) {
-							if (CheckIndex(other[k * MaxOutput], PiecesCount, globals, ErrorCodeInvalidX_NotLastStep))
-								return;
-						}
-					}
-				}
-			}
-		}
-	}
+		    const int o = (actualPiece + 1) * MaxOutput + n; // other id
+		    if (Debug && CheckIndex(o, PiecesCount * MaxOutput,
+				    globals, ErrorCodeInvalidO_NotLastStep))
+			   return;
 
-	if (ind == 0)
-		atomicSub(globals.d_solversCount + actualPiece, count);
+              locals.d_position[o] = __pos[idx];
+		    locals.d_grid[o] = __grid[idx];
 
-	// loop again for a while!
+		    if (Debug && CheckIndex(actualPiece + 1, PiecesCount,
+				    globals, ErrorCodeInvalidActualPiece))
+			   return;
+
+		    const int q = (actualPiece + 1) * PiecesCount * MaxOutput + n; // other id2
+		    if (Debug && CheckIndex(q + (PiecesCount - 1) * MaxOutput, PiecesCount * PiecesCount * MaxOutput,
+				    globals, ErrorCodeInvalidQ_NotLastStep))
+			   return;
+
+		    int* other = locals.d_situation + q;
+		    for (int k = 0; k < PiecesCount; k++) {
+			   other[k * MaxOutput] = current[k * MaxOutput];
+		    }
+		    other[i * MaxOutput] = current[actualPiece * MaxOutput]; // permutation order
+		    other[actualPiece * MaxOutput] = index; // last element of situation
+
+		    if (Debug) {
+			   for (int k = actualPiece + 1; k < PiecesCount; k++) {
+				    if (CheckIndex(other[k * MaxOutput], PiecesCount, globals, ErrorCodeInvalidX_NotLastStep))
+					   return;
+			   }
+		    }
+	   }
+    }
 }
 
 int CudaSolve(CandidatesOffsets candidatesOffsets,	CandidatesMask candidatesMask, SituationT (&solutions)[MaxSolutions]) {
