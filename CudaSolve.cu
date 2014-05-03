@@ -308,7 +308,7 @@ int CudaSolve(CandidatesOffsets candidatesOffsets,	CandidatesMask candidatesMask
 		if (sc > 10000)
 			break;
 
-		bool disp = (n % 500) == 0;
+		bool disp = (n % 200) == 0;
 
 		if (disp) {
 //			std::cout << n << ": s[" << actualPiece << "] = " << count;
@@ -340,6 +340,8 @@ int CudaSolve(CandidatesOffsets candidatesOffsets,	CandidatesMask candidatesMask
 
 		solversCountH[actualPiece] = solversCountV[actualPiece];
 		if (actualPiece < PiecesCount - 1) {
+			if (actualPiece == 5)
+				solversCountV[actualPiece + 1] = 0;
 			solversCountH[actualPiece + 1] = solversCountV[actualPiece + 1];
 		}
 
