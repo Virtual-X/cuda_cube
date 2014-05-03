@@ -34,7 +34,7 @@ $(OUT)/CudaLink.o: $(OUT)/CudaSolve.o
 	$(CU) $(CUFLAGS) $< -o $@ -dlink
 
 $(OUT)/CudaSolve.o: CudaSolve.cu TimerC.h utils.h makefile
-	$(CU) $(CUFLAGS) -c $< -o $@ -dc
+	$(CU) $(CUFLAGS) -c $< -o $@ -dc -lineinfo
 
 clean:
 	rm -f Debug/* && rm -f Release/*

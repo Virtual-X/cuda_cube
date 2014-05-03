@@ -67,6 +67,10 @@ int d_nextValidPosition[256]; // better global? or just while?
 
 __device__
 int GetNextPos(uint64_t grid, int position) {
+//	int pos = position;
+//	while ((grid >> pos) & 1)
+//			pos++;
+//	return pos;
 	int pos = d_nextValidPosition[(grid >> position) & 0xff];
 	if (pos >= 0)
 		return position + pos;
@@ -385,6 +389,10 @@ void CudaStep(const Globals globals, const Locals locals, const int actualPiece,
 				_count = 0;
 			__syncthreads();
 
+			bool valid = idx < totCount - j;
+			if (!valid)
+				return;
+
 //			if (idx == 0) {
 //				globals.d_error[0] = 1000;
 //				globals.d_error[1] = _begin[0];
@@ -397,9 +405,6 @@ void CudaStep(const Globals globals, const Locals locals, const int actualPiece,
 			uint64_t mask;
 			uint64_t grid;
 			int target;
-			bool valid = idx < totCount - j;
-			if (!valid)
-				return;
 
 			if (valid) {
 				px = _px[idx];
@@ -504,7 +509,7 @@ int HostLoop(const Globals globals, const Locals locals, const int steps,
 		}
 		else {
 			CudaStep<false, Debug> <<<gridSize, blockSize>>>(globals, locals, actualPiece, off, count);
-			if (actualPiece == 5)
+			if (actualPiece == 5) // 3 for kernel, 5 for bench
 				solversCountV[actualPiece + 1] = 0;
 			solversCountH[actualPiece + 1] = solversCountV[actualPiece + 1];
 		}
@@ -515,6 +520,8 @@ int HostLoop(const Globals globals, const Locals locals, const int steps,
 }
 
 int CudaSolve(CandidatesOffsets candidatesOffsets, CandidatesMask candidatesMask, SituationT (&solutions)[MaxSolutions]) {
+
+//	cudaDeviceSetCacheConfig( cudaFuncCachePreferShared );
 
 //	int psum[] = { 0, 1, 3, 3, 4, 7, 7, 15, 25, 25 };
 //	for (int j = 25; j < 40; j++) {
@@ -630,7 +637,7 @@ int CudaSolve(CandidatesOffsets candidatesOffsets, CandidatesMask candidatesMask
 	TimerC timerLoop;
 
 	int steps = 0;
-	const int cudaSteps = DoDebug ? 1 : 200;
+	const int cudaSteps = DoDebug ? 1 : 500;
 	int error = 0;
 	while (error == 0) {
 		if (HostLoop<DoDebug>(globals, locals, cudaSteps, solversCountV, solversCountH) < 0)
@@ -642,7 +649,7 @@ int CudaSolve(CandidatesOffsets candidatesOffsets, CandidatesMask candidatesMask
 		int sc = solutionsCountV[0];
 		std::cout << steps << " [" << (DoDebug ? "D" : "R") << "]: solutions = " << sc;
 		timerLoop.Record("");
-		if (sc > 300)
+		if (sc > 30000)
 			break;
 
 		error = errorV[0];
