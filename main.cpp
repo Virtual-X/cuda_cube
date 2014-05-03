@@ -14,8 +14,8 @@ void SolveTetrisCube() {
         board = BoardLoader::LoadFile(boardName);
     }
     catch (std::string& error) {
-        std::cout << "Error loading Tetris4.txt: " << error;
-        std::cout << "\nLoading default problem set..." << std::endl;
+//        std::cout << "Error loading Tetris4.txt: " << error;
+//        std::cout << "\nLoading default problem set..." << std::endl;
         board = BoardLoader::LoadDefault();
     }
 
