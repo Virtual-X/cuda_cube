@@ -17,6 +17,13 @@ enum {
 	BlockSize = 512
 };
 
+enum {
+	NoTest,
+	KernelTest,
+	BenchTest,
+	TestMode = 0
+};
+
 enum ErrorCode {
 	ErrorCodeFinished = -1,
 	ErrorCodeNone = 0,
@@ -63,21 +70,20 @@ int GetCode(uint64_t m, int p) {
 	return ((m >> (p + 1)) & 0x1f) | ((m >> (p + 15 - 5)) & 0xe0);
 }
 
-__constant__
-int d_nextValidPosition[256]; // better global? or just while?
+texture<int, 1, cudaReadModeElementType> tex_nextValidPosition;
 
 __device__
 int GetNextPos(uint64_t grid, int position) {
-//	int pos = position;
-//	while ((grid >> pos) & 1)
-//			pos++;
-//	return pos;
-	int pos = d_nextValidPosition[(grid >> position) & 0xff];
+	//	int pos = position;
+	//	while ((grid >> pos) & 1)
+	//			pos++;
+	//	return pos;
+	int pos = tex1Dfetch(tex_nextValidPosition, (grid >> position) & 0xff);
 	if (pos >= 0)
 		return position + pos;
 	int byte = position / 8;
 	for (int i = byte + 1; i < 8; i++) {
-		pos = d_nextValidPosition[(grid >> (i * 8)) & 0xff];
+		pos = tex1Dfetch(tex_nextValidPosition, (grid >> (i * 8)) & 0xff);
 		if (pos >= 0)
 			return (i * 8) + pos;
 	}
@@ -96,15 +102,13 @@ int InitNextValidPosition(int i) {
 	return validPos;
 }
 
-struct Globals {
-	const int2* d_candidatesOffsets; // [PositionsCount][CodesCount][PiecesCount], d_candidatesOffsets[GetCandidatesOffsetIndex(position, code, piece)]
-	CandidatesMask d_candidatesMask;
+texture<int2, 1, cudaReadModeElementType> tex_candidatesOffsets;
+texture<uint2, 1, cudaReadModeElementType> tex_candidatesMask;
 
+struct Globals {
 	SituationT* d_solutions;
 	int* d_solutionsCount;
-
 	int* d_solversCount; // [PiecesCount]
-
 	int* d_error;
 };
 
@@ -168,15 +172,15 @@ void CudaStep(const Globals globals, const Locals locals, const int actualPiece,
 			globals, ErrorCodeInvalidCandidatesOffsetIndex))
 		return;
 
-	const int2* d_candidatesOffsets_ = globals.d_candidatesOffsets + candidatesOffsetIndex;
 	for (int i = actualPiece; i < PiecesCount; i++) {
 		const int piece = locals.d_situation[id2 + i * MaxOutput];
 		if (Debug && CheckIndex(piece, PiecesCount, globals, ErrorCodeInvalidPiece))
 			return;
 
-		int2 beginEnd = d_candidatesOffsets_[piece];
+		int2 beginEnd = tex1Dfetch(tex_candidatesOffsets, candidatesOffsetIndex + piece);
 		for (int index = beginEnd.x; index < beginEnd.y; index++) {
-			uint64_t mask = globals.d_candidatesMask[index]; // to be coalesced
+			uint2 m = tex1Dfetch(tex_candidatesMask, index);
+			uint64_t mask = ((uint64_t)m.y << 32) | m.x;
 			if (!(mask & grid)) {
 				const int* current = locals.d_situation + id2;
 				if (IsLastStep) {
@@ -294,8 +298,10 @@ int HostLoop(const Globals globals, const Locals locals, const int steps,
 		}
 		else {
 			CudaStep<false, Debug> <<<gridSize, blockSize>>>(globals, locals, actualPiece, off, count);
-//			if (actualPiece == 5) // 3 for kernel, 5 for bench
-//				solversCountV[actualPiece + 1] = 0;
+			if (TestMode != NoTest) {
+				if (actualPiece == (TestMode == KernelTest ? 3 : 5))
+					solversCountV[actualPiece + 1] = 0;
+			}
 			solversCountH[actualPiece + 1] = solversCountV[actualPiece + 1];
 		}
 		cudaDeviceSynchronize();
@@ -329,17 +335,24 @@ int CudaSolve(CandidatesOffsets candidatesOffsets, CandidatesMask candidatesMask
 	}
 
 	thrust::device_vector<int2> candidatesOffsetsV(candidatesOffsetsH);
-	globals.d_candidatesOffsets = raw(candidatesOffsetsV);
+	cudaBindTexture(0, tex_candidatesOffsets, raw(candidatesOffsetsV), sizeof(int2) * candidatesOffsetsV.size());
+	checkCudaErrors(cudaGetLastError());
 
-	thrust::device_vector<uint64_t> candidatesMaskV(candidatesMask, candidatesMask + masksCount);
-	globals.d_candidatesMask = raw(candidatesMaskV);
+	thrust::host_vector<uint2> candidatesMaskH(masksCount);
+	for (int i = 0; i < masksCount; i++) {
+		candidatesMaskH[i] = make_uint2(candidatesMask[i], candidatesMask[i] >> 32);
+	}
+	thrust::device_vector<uint2> candidatesMaskV(candidatesMaskH);
+	cudaBindTexture(0, tex_candidatesMask, raw(candidatesMaskV), sizeof(uint2) * candidatesMaskV.size());
+	checkCudaErrors(cudaGetLastError());
 
 	thrust::host_vector<int> nextValidPositionH(256);
 	for (int i = 0; i < 256; i++) {
 		nextValidPositionH[i] = InitNextValidPosition(i);
 	}
 	thrust::device_vector<int> nextValidPositionV(nextValidPositionH);
-	cudaMemcpyToSymbol(d_nextValidPosition, raw(nextValidPositionV), sizeof(int) * nextValidPositionV.size());
+	cudaBindTexture(0, tex_nextValidPosition, raw(nextValidPositionV), sizeof(int) * nextValidPositionV.size());
+	checkCudaErrors(cudaGetLastError());
 
 	thrust::device_vector<int> solutionsCountV(1);
 	globals.d_solutionsCount = raw(solutionsCountV);
@@ -406,7 +419,13 @@ int CudaSolve(CandidatesOffsets candidatesOffsets, CandidatesMask candidatesMask
 	const int solutionsCount = solutionsCountV[0];
 	thrust::copy(solutionsV.begin(), solutionsV.begin() + solutionsCount, solutions);
 
+	cudaUnbindTexture(tex_candidatesOffsets);
+	checkCudaErrors(cudaGetLastError());
+	cudaUnbindTexture(tex_candidatesMask);
+	checkCudaErrors(cudaGetLastError());
+
+
 	timerInit.Record("\nTotal");
-	std::cout << "Solutions found: " << solutionsCountV[0] << std::endl;
+	std::cout << "Solutions found: " << solutionsCount << std::endl;
 	return solutionsCount;
 }
