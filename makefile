@@ -13,7 +13,7 @@ endif
 
 CUFLAGS += -arch=sm_35
 
-LINKFLAGS += -L/usr/local/cuda-6.0/lib64/ -lcudart
+LINKFLAGS += -L/usr/local/cuda-6.0/lib64/ -lcudart -lcudadevrt
 
 CXXFLAGS += -I/home/igor/Development/qt-workspace/App/TetrisCube
 CUFLAGS += -I/home/igor/Development/qt-workspace/App/TetrisCube
@@ -24,14 +24,17 @@ TARGET = $(OUT)/cuda_cube
 
 all: $(TARGET)
 
-$(OUT)/cuda_cube: $(OUT)/main.o $(OUT)/CudaSolve.o makefile
-	$(CXX) $(CXXFLAGS) $(OUT)/main.o $(OUT)/CudaSolve.o -o $@ $(LINKFLAGS)
+$(OUT)/cuda_cube: $(OUT)/main.o $(OUT)/CudaSolve.o $(OUT)/CudaLink.o makefile
+	$(CXX) $(CXXFLAGS) $(OUT)/main.o $(OUT)/CudaSolve.o $(OUT)/CudaLink.o -o $@ $(LINKFLAGS)
 
 $(OUT)/main.o: main.cpp SolverC.h makefile
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
+$(OUT)/CudaLink.o: $(OUT)/CudaSolve.o
+	$(CU) $(CUFLAGS) $< -o $@ -dlink
+
 $(OUT)/CudaSolve.o: CudaSolve.cu TimerC.h utils.h makefile
-	$(CU) $(CUFLAGS) -c $< -o $@
+	$(CU) $(CUFLAGS) -c $< -o $@ -dc -lineinfo
 
 clean:
 	rm -f Debug/* && rm -f Release/*
